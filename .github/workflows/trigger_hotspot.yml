@@ -1,0 +1,52 @@
+name: 热点捕捉定时触发
+
+on:
+  schedule:
+    # 每天 08:00 CST (UTC+8) = UTC 00:00
+    - cron: '0 0 * * *'
+    # 每天 20:00 CST (UTC+8) = UTC 12:00
+    - cron: '0 12 * * *'
+  # 允许手动触发（测试用）
+  workflow_dispatch:
+
+jobs:
+  trigger-dify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 触发 Dify 热点捕捉工作流
+        run: |
+          echo "触发时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M CST')"
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --max-time 300 \
+            -X POST "https://api.dify.ai/v1/workflows/run" \
+            -H "Authorization: Bearer app-4Pga5BASxYS9whGhLTpKQGCx" \
+            -H "Content-Type: application/json" \
+            -d '{"inputs": {}, "response_mode": "blocking", "user": "github-actions-scheduler"}')
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          echo "HTTP 状态码: $HTTP_CODE"
+          echo "响应内容: $BODY"
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "工作流触发成功"
+            # 提取推送结果
+            PUSHED=$(echo "$BODY" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    outputs = d.get('data', {}).get('outputs', {})
+    print(f'推送结果: {outputs.get(\"result_summary\", \"无摘要\")}')
+    print(f'推送数量: {outputs.get(\"pushed_count\", 0)} 条')
+except:
+    print('解析响应失败')
+" 2>/dev/null || echo "解析跳过")
+            echo "$PUSHED"
+          else
+            echo "工作流触发失败，HTTP 状态码: $HTTP_CODE"
+            exit 1
+          fi
