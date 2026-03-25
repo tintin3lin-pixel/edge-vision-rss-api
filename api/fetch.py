@@ -1,5 +1,5 @@
 """
-Edge Vision RSS Aggregator API v2.0
+Edge Vision RSS Aggregator API v3.0
 Vercel Serverless Function - Python Runtime
 
 三层过滤架构：
@@ -11,8 +11,12 @@ import json
 import re
 import time
 import urllib.request
+import ssl
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler
+
+# SSL context（跳过证书验证，兼容 Vercel 沙箱环境）
+SSL_CTX = ssl._create_unverified_context()
 
 
 # ============================================================
@@ -35,12 +39,15 @@ PERSON_KEYWORDS = [
     "satya nadella", "mustafa suleyman",
     # xAI / Tesla
     "elon musk",
-    # Independent
-    "andrej karpathy", "geoffrey hinton", "gary marcus",
+    # Independent researchers
+    "andrej karpathy", "karpathy", "geoffrey hinton", "gary marcus",
+    "ethan mollick", "jim fan", "swyx",
     # VC / Capital
     "marc andreessen", "peter thiel", "reid hoffman",
+    "ben horowitz", "vinod khosla",
     # China
     "李彦宏", "马化腾", "张朝阳", "任正非", "王小川",
+    "梁文锋", "杨植麟",
 ]
 
 # B. 公司/产品维度 - 追踪具体公司的发布/融资/政策
@@ -54,9 +61,10 @@ COMPANY_KEYWORDS = [
     "groq", "cerebras", "sambanova", "tenstorrent",
     # Cloud
     "aws", "azure", "google cloud", "cloudflare",
-    # AI Apps
+    # AI Apps / Tools
     "cursor", "perplexity", "midjourney", "runway", "elevenlabs",
     "character.ai", "character ai", "claude", "chatgpt", "gemini", "copilot",
+    "manus", "devin", "swe-agent",
     # China AI
     "deepseek", "kimi", "moonshot", "zhipu", "智谱", "月之暗面",
     "零一万物", "百川", "讯飞", "文心", "通义", "混元",
@@ -66,7 +74,7 @@ COMPANY_KEYWORDS = [
 # C. 技术事件维度 - 追踪范式突破/行业格局变化
 TECH_EVENT_KEYWORDS = [
     # 模型能力突破
-    "agi", "superintelligence", "reasoning model", "o3", "o4",
+    "agi", "superintelligence", "reasoning model", "o3", "o4", "o5",
     "multimodal", "vision model", "audio model", "video generation",
     "context window", "long context", "1m token", "10m token",
     "benchmark", "surpass human", "state of the art", "sota",
@@ -76,6 +84,7 @@ TECH_EVENT_KEYWORDS = [
     "rlhf", "dpo", "constitutional ai", "alignment",
     "rag", "retrieval", "tool use", "function calling",
     "agent", "agentic", "autonomous", "self-improving", "multi-agent",
+    "mcp", "model context protocol",
     # 行业事件
     "acquisition", "merger", "ipo", "funding round", "series",
     "valuation", "billion", "layoff", "hiring",
@@ -126,17 +135,35 @@ HIGH_QUALITY_SOURCES = [
 
 # 混杂源：内容宽泛，只保留含追踪词的条目
 MIXED_SOURCES = [
+    # 科技社区
     ("https://hnrss.org/frontpage",               "Hacker News",       "developer"),
+    ("https://hnrss.org/newest?q=AI+LLM+Agent",  "HN AI",             "developer"),
+    # 主流科技媒体
     ("https://techcrunch.com/feed/",              "TechCrunch",        "industry"),
-    ("https://www.theverge.com/rss/index.xml",    "The Verge",         "industry"),
-    ("https://feeds.wired.com/wired/index",       "Wired",             "industry"),
+    ("https://feeds.bloomberg.com/technology/news.rss", "Bloomberg Tech", "industry"),
+    ("https://feeds.bbci.co.uk/news/technology/rss.xml", "BBC Tech",   "industry"),
     ("https://www.technologyreview.com/feed/",    "MIT Tech Review",   "research"),
+    ("https://feeds.arstechnica.com/arstechnica/technology-lab", "Ars Technica", "industry"),
     ("https://venturebeat.com/feed/",             "VentureBeat",       "industry"),
+    ("https://www.ft.com/technology?format=rss",  "FT Technology",     "industry"),
+    # VC
     ("https://www.sequoiacap.com/feed/",          "Sequoia Blog",      "capital"),
+    # 产品
     ("https://www.producthunt.com/feed",          "Product Hunt",      "product"),
+    # 播客/分析
     ("https://lexfridman.com/feed/podcast/",      "Lex Fridman",       "analysis"),
+    # 中文媒体
     ("https://36kr.com/feed",                     "36Kr",              "china"),
     ("https://www.pingwest.com/feed",             "PingWest",          "china"),
+    ("https://www.infoq.cn/feed?type=ai",         "InfoQ AI",          "china"),
+]
+
+# GitHub Trending（每日热门开源项目）
+GITHUB_SOURCES = [
+    ("https://mshibanami.github.io/GitHubTrendingRSS/daily/all.xml",
+     "GitHub Trending Daily", "developer"),
+    ("https://mshibanami.github.io/GitHubTrendingRSS/daily/python.xml",
+     "GitHub Trending Python", "developer"),
 ]
 
 # Google News 专题追踪源（按人物/公司定制）
@@ -145,6 +172,8 @@ GOOGLE_NEWS_SOURCES = [
      "GNews: Jensen Huang", "person_track"),
     ("https://news.google.com/rss/search?q=Sam+Altman+OpenAI&hl=en&gl=US&ceid=US:en",
      "GNews: Sam Altman", "person_track"),
+    ("https://news.google.com/rss/search?q=Andrej+Karpathy+AI&hl=en&gl=US&ceid=US:en",
+     "GNews: Karpathy", "person_track"),
     ("https://news.google.com/rss/search?q=Elon+Musk+xAI+Grok&hl=en&gl=US&ceid=US:en",
      "GNews: Elon Musk xAI", "person_track"),
     ("https://news.google.com/rss/search?q=Anthropic+Claude+AI&hl=en&gl=US&ceid=US:en",
@@ -157,6 +186,8 @@ GOOGLE_NEWS_SOURCES = [
      "GNews: AI Funding", "capital_track"),
     ("https://news.google.com/rss/search?q=DeepSeek+Kimi+Chinese+AI&hl=en&gl=US&ceid=US:en",
      "GNews: China AI", "china_track"),
+    ("https://news.google.com/rss/search?q=AI+Agent+MCP+autonomous&hl=en&gl=US&ceid=US:en",
+     "GNews: AI Agent", "tech_event"),
 ]
 
 # Reddit 社区（开发者第一手讨论）
@@ -167,6 +198,20 @@ REDDIT_SOURCES = [
     ("https://www.reddit.com/r/singularity/.rss",      "Reddit Singularity","developer"),
 ]
 
+# Nitter RSS - 关键人物 Twitter 追踪（使用 nitter.net）
+NITTER_INSTANCE = "https://nitter.net"
+NITTER_SOURCES = [
+    (f"{NITTER_INSTANCE}/karpathy/rss",    "Twitter: Karpathy",    "person_track"),
+    (f"{NITTER_INSTANCE}/sama/rss",        "Twitter: Sam Altman",  "person_track"),
+    (f"{NITTER_INSTANCE}/ylecun/rss",      "Twitter: Yann LeCun",  "person_track"),
+    (f"{NITTER_INSTANCE}/elonmusk/rss",    "Twitter: Elon Musk",   "person_track"),
+    (f"{NITTER_INSTANCE}/gdb/rss",         "Twitter: Greg Brockman","person_track"),
+    (f"{NITTER_INSTANCE}/demishassabis/rss","Twitter: Demis Hassabis","person_track"),
+    (f"{NITTER_INSTANCE}/drjimfan/rss",    "Twitter: Jim Fan",     "person_track"),
+    (f"{NITTER_INSTANCE}/emollick/rss",    "Twitter: Ethan Mollick","person_track"),
+    (f"{NITTER_INSTANCE}/swyx/rss",        "Twitter: swyx",        "developer"),
+]
+
 
 # ============================================================
 # 核心函数
@@ -175,9 +220,9 @@ REDDIT_SOURCES = [
 def fetch_rss(url, source_name, source_dim, timeout=12):
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; EdgeVisionBot/2.0)"
+            "User-Agent": "Mozilla/5.0 (compatible; EdgeVisionBot/3.0)"
         })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
             content = resp.read().decode("utf-8", errors="ignore")
 
         items = []
@@ -258,7 +303,15 @@ def aggregate():
             failed.append(name)
         time.sleep(0.15)
 
-    # 3. Google News 专题追踪源：全量保留
+    # 3. GitHub Trending：只保留含追踪词的条目
+    for url, name, dim in GITHUB_SOURCES:
+        items = fetch_rss(url, name, dim)
+        filtered = [i for i in items if contains_track_keyword(i["title"])]
+        if filtered:
+            all_items.extend(filtered)
+        time.sleep(0.15)
+
+    # 4. Google News 专题追踪源：全量保留
     for url, name, dim in GOOGLE_NEWS_SOURCES:
         items = fetch_rss(url, name, dim)
         if items:
@@ -267,7 +320,7 @@ def aggregate():
             failed.append(name)
         time.sleep(0.2)
 
-    # 4. Reddit 社区：只保留含追踪词的条目
+    # 5. Reddit 社区：只保留含追踪词的条目
     for url, name, dim in REDDIT_SOURCES:
         items = fetch_rss(url, name, dim)
         filtered = [i for i in items if contains_track_keyword(i["title"])]
@@ -275,7 +328,16 @@ def aggregate():
             all_items.extend(filtered)
         time.sleep(0.2)
 
-    # 5. 去重（标题指纹）
+    # 6. Nitter Twitter 追踪：全量保留（已是目标人物账号）
+    for url, name, dim in NITTER_SOURCES:
+        items = fetch_rss(url, name, dim, timeout=8)
+        if items:
+            all_items.extend(items)
+        else:
+            failed.append(name)
+        time.sleep(0.3)
+
+    # 7. 去重（标题指纹）
     seen = set()
     deduped = []
     for item in all_items:
@@ -287,14 +349,14 @@ def aggregate():
             item["track_dims"] = dims
             deduped.append(item)
 
-    # 6. 统计
+    # 8. 统计
     src_counts = {}
     dim_counts = {}
     for item in deduped:
         src_counts[item["source"]] = src_counts.get(item["source"], 0) + 1
         dim_counts[item["dimension"]] = dim_counts.get(item["dimension"], 0) + 1
 
-    top_sources = sorted(src_counts.items(), key=lambda x: -x[1])[:12]
+    top_sources = sorted(src_counts.items(), key=lambda x: -x[1])[:15]
     fetch_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M CST")
 
     return {
